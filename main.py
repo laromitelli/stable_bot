@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import base64
 import hashlib
 import hmac
@@ -11,6 +8,7 @@ import string
 import sys
 import time
 
+import math
 import requests
 
 WAIT_MINUTES = 5
@@ -22,7 +20,7 @@ BTMXCFG = {
     "https": "https://ascendex.com",
     "wss": "wss://ascendex.com:443",
     "group": 6,
-    "apikey": "YOR_KEY",
+    "apikey": "YOUR_KEY",
     "secret": "YOUR_SECRET"
 }
 
@@ -90,10 +88,13 @@ def initialize_logger():
 
 class StableBot:
 
-    def __init__(self, budget, stable_pair, max_buy_stable_value, min_sell_stable_value):
+    def __init__(self, budget, min_order_size, coin, base_coin, max_buy_stable_value, min_sell_stable_value):
         # User Setting variables
         self.budget = budget
-        self.stable_pair = stable_pair
+        self.min_order_size = min_order_size
+        self.coin = coin
+        self.base_coin = base_coin
+        self.stable_pair = '{}/{}'.format(coin, base_coin)
         self.max_buy_stable_value = max_buy_stable_value
         self.min_sell_stable_value = min_sell_stable_value
         # Other useful variables
@@ -105,6 +106,9 @@ class StableBot:
         self.group = BTMXCFG['group']
         self.apikey = BTMXCFG['apikey']
         self.secret = BTMXCFG['secret']
+        self.coin_balance = None
+        self.base_balance = None
+        self.orders = []
 
     def ticker_info(self):
         api_url = "{}/{}/ticker".format(self.host, ROUTE_PREFIX)
@@ -122,6 +126,30 @@ class StableBot:
                 if order['symbol'] == self.stable_pair and order['status'] not in ['Filled', 'Cancelled', 'Rejected']:
                     return True
         return False
+
+    def clean_orders(self):
+            logging.info("Checking if orders are fulfilled..")
+            ts = utc_timestamp() + 30000
+            headers = make_auth_headers(ts, "order/hist/current", self.apikey, self.secret)
+            url = "{}/{}/api/pro/v1/cash/order/hist/current".format(self.host, self.group)
+            res = requests.get(url, headers=headers)
+            logging.info("Response order history: {}".format(res.json()))
+            filled_ids = []
+            if res is not None and "data" in res.json() and len(res.json()['data']) > 0:
+                for order in res.json()['data']:
+                    if order['symbol'] == self.stable_pair and order['status'] not in ['Filled']:
+                        filled_ids.append(order['orderId'])
+                # Got filled order ids, removing these orders from our local orders (because filled and no more needed)
+                i = len(self.orders) - 1
+                while i >= 0:
+                    order = self.orders[i]
+                    if "order_id" in order:
+                        for id_order in filled_ids:
+                            if order["order_id"] == id_order:
+                                self.orders.pop(i)
+                    i = i - 1
+            else:
+                logging.info("Cannot clean orders with history")
 
     def check_balance(self, asset):
         ts = utc_timestamp() + 30000
@@ -153,7 +181,7 @@ class StableBot:
 
     def place_buy_order(self):
         api_url = "{}/{}/api/pro/v1/cash/order".format(self.host, self.group)
-        logging.info("Placing BUY order for {} USDT in {} pair price: {}".format(self.budget,
+        logging.info("Placing BUY order for {} USDT in {} pair price: {}".format(self.min_order_size,
                                                                                  self.stable_pair,
                                                                                  self.max_buy_stable_value))
         ts = utc_timestamp() + 30000
@@ -162,7 +190,7 @@ class StableBot:
             time=ts,
             symbol=self.stable_pair,
             orderPrice=str(self.max_buy_stable_value),
-            orderQty=str(self.budget),
+            orderQty=str(self.min_order_size),
             orderType="limit",
             side="buy"
         )
@@ -170,65 +198,119 @@ class StableBot:
         res = requests.post(api_url, headers=headers, json=order)
         logging.info("Request response: {}".format(res.json()))
 
-        return res is not None and "code" in res.json() and res.json()['code'] == 0
+        if res is None or "code" not in res.json() or res.json()['code'] != 0:
+            return -1
+        else:
+            return res.json()['data']['info']['orderId']
 
-    def place_sell_order(self, quantity):
-        api_url = "{}/{}/api/pro/v1/cash/order".format(self.host, self.group)
-        logging.info("Placing SELL order for {} pair.".format(self.stable_pair))
-        ts = utc_timestamp() + 30000
-        order = dict(
-            id=uuid32(),
-            time=ts,
-            symbol=self.stable_pair,
-            orderPrice=str(self.min_sell_stable_value),
-            orderQty=str(quantity),
-            orderType="limit",
-            side="sell"
-        )
-        headers = make_auth_headers(ts, "order", self.apikey, self.secret)
-        res = requests.post(api_url, headers=headers, json=order)
-        logging.info("Request response: {}".format(res.json()))
+    def place_sell_order(self):
+            api_url = "{}/{}/api/pro/v1/cash/order".format(self.host, self.group)
+            logging.info("Placing SELL order for {} pair.".format(self.stable_pair))
+            ts = utc_timestamp() + 30000
+            order = dict(
+                id=uuid32(),
+                time=ts,
+                symbol=self.stable_pair,
+                orderPrice=str(self.min_sell_stable_value),
+                orderQty=str(self.min_order_size),
+                orderType="limit",
+                side="sell"
+            )
+            headers = make_auth_headers(ts, "order", self.apikey, self.secret)
+            res = requests.post(api_url, headers=headers, json=order)
+            logging.info("Request response: {}".format(res.json()))
 
-        return res is not None and "code" in res.json() and res.json()['code'] == 0
+            if res is None or "code" not in res.json() or res.json()['code'] != 0:
+                return -1
+            else:
+                return res.json()['data']['info']['orderId']
+
+    def split_orders(self):
+        # Counting open sell and buy order to remove that amount from the budget
+        open_buy_orders = 0
+        open_sell_orders = 0
+        for order in self.orders:
+            if order['type'] == "buy":
+                open_buy_orders = open_buy_orders + 1
+            else:
+                open_sell_orders = open_sell_orders + 1
+
+        # Getting balances from exchange
+        self.base_balance = self.get_balance(self.base_coin)
+        self.coin_balance = self.get_balance(self.coin)
+        if self.base_balance > self.budget - (open_buy_orders * self.min_order_size):
+            self.base_balance = self.budget - (open_buy_orders * self.min_order_size)
+        if self.coin_balance > self.budget - (open_sell_orders * self.min_order_size):
+            self.coin_balance = self.budget - (open_sell_orders * self.min_order_size)
+        # Creating order to set
+        id_order = len(self.orders) + 1
+        i = 0
+        while i < math.floor(self.base_balance / self.min_order_size):
+            order = {"type" : "buy", "id": id_order}
+            self.orders.append(order)
+            i = i + 1
+            id_order = id_order + 1
+        i = 0
+        while i < math.floor(self.coin_balance / self.min_order_size):
+            order = {"type" : "sell", "id": id_order}
+            self.orders.append(order)
+            i = i + 1
+            id_order = id_order + 1
+        new_order = 0
+        for order in self.orders:
+            if "order_id" not in order:
+                new_order = new_order + 1
+        if new_order == 0:
+            logging.info("Not enough balance to set order")
+            return False
+        return True
 
     def run(self):
         logging.info(self.ticker_info())
         while True:
             try:
-                if self.has_pair_open_orders():
-                    logging.info("No operation needed. Waiting till order is filled.")
-                else:
-                    if self.check_balance(base_coin):
-                        logging.info("Enough {} balance. Placing buy order.".format(base_coin))
-                        if self.place_buy_order():
-                            logging.info("Buy order placed.")
-                        else:
-                            logging.info("Error placing buy order.")
-                    elif self.check_balance(coin):
-                        coin_balance_amount = self.get_balance(coin)
-                        logging.info(
-                            "Not enough {} but enough {} ({}). Placing sell order.".format(base_coin, coin,
-                                                                                           coin_balance_amount))
-                        if self.place_sell_order(coin_balance_amount):
-                            logging.info("Sell order placed.")
-                        else:
-                            logging.info("Error sell placing order.")
-                    else:
-                        logging.info("Not enough {} nor {}.".format(base_coin, coin))
+                self.clean_orders()
+                if self.split_orders():
+                    # place order
+                    for order in self.orders:
+                        if "order_id" not in order:
+                            if order['type'] == 'buy':
+                                order_id = self.place_buy_order()
+                                if order_id != -1:
+                                    logging.info("Buy order with id {} placed.".format(order_id))
+                                    order['order_id'] = order_id
+                                else:
+                                    logging.info("Error placing buy order.")
+                            else:
+                                order_id = self.place_sell_order()
+                                if order_id != -1:
+                                    logging.info("Sell order with id {} placed.".format(order_id))
+                                    order['order_id'] = order_id
+                                else:
+                                    logging.info("Error placing sell order.")
+                    # Remove all orders without order_id (not set for any reason)
+                    i = len(self.orders) - 1
+                    while i >= 0:
+                        order = self.orders[i]
+                        if "order_id" not in order:
+                            self.orders.pop(i)
+                        i = i - 1
+                logging.info("Current order status: {}\n".format(self.orders))
                 logging.info("Execution finished.\nTrying again in {} minutes.".format(WAIT_MINUTES))
-                time.sleep(WAIT_MINUTES*60)
+                time.sleep(WAIT_MINUTES * 60)
             except Exception as e:
                 logging.info("Exception while running bot: {}.\nTrying again in {} minutes.".format(e, WAIT_MINUTES))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     # Configure following variable
     coin = 'XDAI'
     base_coin = 'USDT'
-    chosen_budget = 100
-    min_price = 0.9
-    max_price = 1.1
+    chosen_budget = 2700
+    min_order = 100
+    min_price = 0.9958
+    max_price = 1.0006
     # From these line below don't touch
     initialize_logger()
-    stable_bot = StableBot(chosen_budget, '{}/{}'.format(coin, base_coin), min_price, max_price)
+    stable_bot = StableBot(chosen_budget, min_order, coin, base_coin, min_price, max_price)
     stable_bot.run()
